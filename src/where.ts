@@ -5,12 +5,25 @@ type WhereOperator = CleanedWhere["operator"];
 
 export function planQuery(where: CleanedWhere[] = [], allowScan = false, hints: PlannerHints = {}): QueryPlan {
   assertSupportedOperators(where);
-  const keyedProblem = keyedAccessProblem(where);
+  const keyedProblem = keyedAccessProblem(where, hints);
   if (keyedProblem) return scanOrThrow(where, allowScan, keyedProblem);
   const keyed = keyedPlan(where, hints);
   if (keyed) return keyed;
   if (allowScan) return { kind: "byModel", where };
-  throw new UnsupportedQueryError("Query requires a table scan. Pass unsafeAllowScan to enable bounded scans explicitly.");
+  throw new UnsupportedQueryError(scanRequiredMessage(where, hints));
+}
+
+/** `id` is the entity key; other fields are sidecar-indexed unless excluded or outside a configured allowlist. */
+export function isIndexedField(field: string, hints: PlannerHints = {}): boolean {
+  if (field === "id") return false;
+  if (hints.nonIndexedFields?.includes(field)) return false;
+  return hints.indexedFields ? hints.indexedFields.includes(field) : true;
+}
+
+function scanRequiredMessage(where: CleanedWhere[], hints: PlannerHints): string {
+  const unindexed = where.find((clause) => isKeyedEquality(clause) && clause.field !== "id" && !isIndexedField(clause.field, hints));
+  const base = "Query requires a table scan. Pass unsafeAllowScan to enable bounded scans explicitly.";
+  return unindexed ? `${base} Field "${unindexed.field}" is not sidecar-indexed (see indexedFields / nonIndexedFields).` : base;
 }
 
 function keyedPlan(where: CleanedWhere[], hints: PlannerHints): QueryPlan | undefined {
@@ -18,7 +31,7 @@ function keyedPlan(where: CleanedWhere[], hints: PlannerHints): QueryPlan | unde
   if (inWhere(where, "id")) return { kind: "byIdValues", where };
   const clause = mostSelectiveEquality(where, hints);
   if (clause) return { kind: "byFieldValue", where, clause };
-  if (safeInWhere(where)) return { kind: "byFieldValues", where };
+  if (safeInWhere(where, hints)) return { kind: "byFieldValues", where };
   return undefined;
 }
 
@@ -33,7 +46,7 @@ export function matchesWhere(item: Record<string, unknown>, where: CleanedWhere[
  * nulls, configured fields such as account.providerId) last. Ties keep where order.
  */
 export function mostSelectiveEquality(where: CleanedWhere[] = [], hints: PlannerHints = {}): CleanedWhere | undefined {
-  const candidates = where.filter((w) => isKeyedEquality(w) && isScalar(w.value));
+  const candidates = where.filter((w) => isKeyedEquality(w) && isScalar(w.value) && isIndexedField(w.field, hints));
   return candidates.reduce<CleanedWhere | undefined>((best, clause) => (best && selectivityRank(best, hints) >= selectivityRank(clause, hints) ? best : clause), undefined);
 }
 
@@ -55,8 +68,8 @@ export function scalarValues(clause: CleanedWhere): (string | number | boolean |
   return Array.isArray(clause.value) ? clause.value.filter(isScalar) as (string | number | boolean | Date | null)[] : [];
 }
 
-export function safeInWhere(where: CleanedWhere[]): CleanedWhere | undefined {
-  return where.find(isSafeIn);
+export function safeInWhere(where: CleanedWhere[], hints: PlannerHints = {}): CleanedWhere | undefined {
+  return where.find((clause) => isSafeIn(clause) && isIndexedField(clause.field, hints));
 }
 
 export function eqWhere(where: CleanedWhere[], field: string): CleanedWhere | undefined {
@@ -102,9 +115,9 @@ function combine(acc: boolean, value: boolean, connector: "AND" | "OR" | undefin
   return connector === "OR" ? acc || value : acc && value;
 }
 
-function keyedAccessProblem(where: CleanedWhere[]): string | undefined {
+function keyedAccessProblem(where: CleanedWhere[], hints: PlannerHints): string | undefined {
   if (hasOrPredicate(where)) return "OR predicates cannot use DynamoDB keyed access without risking incomplete results. Pass unsafeAllowScan: true to evaluate OR predicates with an explicit bounded scan.";
-  if (hasSafeKeyedEquality(where)) return undefined;
+  if (hasSafeKeyedEquality(where, hints)) return undefined;
   if (hasInsensitiveEquality(where)) return "Case-insensitive equality cannot use DynamoDB keyed access (including case-insensitive IN) because id and scalar sidecar keys are case-sensitive. Pass unsafeAllowScan: true to evaluate it with an explicit bounded scan.";
   return undefined;
 }
@@ -118,8 +131,13 @@ function hasOrPredicate(where: CleanedWhere[]): boolean {
   return where.length > 1 && where.some((clause) => clause.connector === "OR");
 }
 
-function hasSafeKeyedEquality(where: CleanedWhere[]): boolean {
-  return where.some((clause) => (isKeyedEquality(clause) && isScalar(clause.value)) || isSafeIn(clause));
+function hasSafeKeyedEquality(where: CleanedWhere[], hints: PlannerHints): boolean {
+  return where.some((clause) => isKeyedAnchor(clause, hints));
+}
+
+function isKeyedAnchor(clause: CleanedWhere, hints: PlannerHints): boolean {
+  const keyed = (isKeyedEquality(clause) && isScalar(clause.value)) || isSafeIn(clause);
+  return keyed && (clause.field === "id" || isIndexedField(clause.field, hints));
 }
 
 function hasInsensitiveEquality(where: CleanedWhere[]): boolean {

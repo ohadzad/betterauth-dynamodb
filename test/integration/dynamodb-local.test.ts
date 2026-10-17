@@ -16,6 +16,7 @@ import { DynamoDBAdapterError, DynamoDBConflictError, UnsupportedQueryError, dyn
 import type { BetterAuthDynamoDBOptions } from "../../src/index.js";
 import { compoundUniqueIndexName, compoundUniquePk, compoundUniqueSk, entitySk, indexPk, indexSk, modelPk, uniquePk, valueSk } from "../../src/keys.js";
 import { REVISION_ATTRIBUTE } from "../../src/serialize.js";
+import { DynamoDBStore } from "../../src/dynamodb-adapter.js";
 
 const IMAGE = "amazon/dynamodb-local:2.6.1";
 const REGION = "us-east-1";
@@ -216,6 +217,24 @@ describe("DynamoDB Local adapter integration", () => {
     await expect(adapter.findOne({ model: "plugin", where: [eq("id", "active")] })).resolves.toMatchObject({ id: "active", ttl: 1, expiresAt: "2030-01-01T00:00:00.000Z" });
   });
 
+  it("stores account secrets only on the entity row and cleans up sidecars written before they were excluded", async () => {
+    // The bare store has no factory defaults, so it indexes every scalar field like earlier releases did.
+    const legacy = new DynamoDBStore({ tableName, client: docClient });
+    await legacy.create("account", { id: "acc-legacy", userId: "u-sec", providerId: "google", accountId: "g-legacy", accessToken: "legacy-token", createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() });
+    const adapter = adapterFor({ client: docClient });
+    await create(adapter, "user", { id: "u-sec", name: "S", email: "sec@example.com" });
+    await expect(rawRowsByModel("_index_account")).resolves.toEqual(expect.arrayContaining([expect.objectContaining({ indexField: "accessToken" })]));
+
+    await create(adapter, "account", { id: "acc-new", userId: "u-sec", providerId: "credential", accountId: "u-sec", password: "pw-hash", accessToken: "new-token", refreshToken: "refresh", idToken: "idt" });
+    await adapter.update({ model: "account", where: [eq("id", "acc-legacy")], update: { accessToken: "rotated-token" } });
+
+    const sidecars = await rawRowsByModel("_index_account");
+    expect(sidecars.map((row) => row.indexField)).not.toEqual(expect.arrayContaining(["accessToken"]));
+    for (const field of ["password", "accessToken", "refreshToken", "idToken", "id"]) expect(sidecars.some((row) => row.indexField === field)).toBe(false);
+    expect(JSON.stringify(sidecars)).not.toMatch(/pw-hash|token|refresh|idt/);
+    await expect(adapter.findOne({ model: "account", where: [eq("providerId", "google"), eq("accountId", "g-legacy")] })).resolves.toMatchObject({ accessToken: "rotated-token" });
+  });
+
   it("resolves OAuth account keys without walking every account of the provider", async () => {
     const adapter = adapterFor({ client: docClient, pageSize: 1, maxPages: 3 });
     await create(adapter, "user", { id: "u-oauth", name: "O", email: "oauth@example.com" });
@@ -318,7 +337,8 @@ describe("DynamoDB Local adapter integration", () => {
 
   it("rejects a transaction over 100 actions before writing", async () => {
     const sends = { count: 0 };
-    const adapter = adapterFor({ client: countingClient(sends) });
+    // entity + 99 sidecars + 1 unique lock = 101 actions (id is the entity key and has no sidecar).
+    const adapter = adapterFor({ client: countingClient(sends), uniqueFields: { wide: ["field-0"] } });
     const data: Record<string, unknown> = { id: "too-many-actions" };
     for (let index = 0; index < 99; index += 1) data[`field-${index}`] = `value-${index}`;
 

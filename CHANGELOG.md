@@ -6,12 +6,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Changed (storage format, backwards compatible)
+
+- `id` no longer gets a scalar sidecar: it is the entity key and the planner always reads it with `GetItem`. Creates write one fewer transactional action.
+- New sidecar and unique-lock rows no longer store plaintext copies of the value (`indexValue`, `entity.value`, and a value-bearing lock `id`); they keep owner keys and the field name. Reads never used these attributes, so existing rows remain fully readable.
+- Sidecars written by earlier releases for `id` and for fields that are now non-indexed are deleted, owner-guarded, when their record is next updated, deleted, consumed, or incremented (`cleanupNonIndexedSidecars`, default `true`). Records that are never mutated keep their old sidecars until deleted; they are harmless to reads but still hold the old plaintext copies, so rewrite or clean them up if that matters.
+
 ### Fixed
 
 - The query planner now anchors keyed reads on the most selective scalar equality instead of the first one. Better Auth core looks up OAuth accounts with `providerId` before `accountId`, so every Google/Apple sign-in previously queried the `providerId` sidecar partition, drained every account of that provider, and issued one owner `GetItem` per account (or threw once `maxPages` was reached). Unique fields are preferred, then ordinary fields, then low-cardinality fields.
 
 ### Added
 
+- `indexedFields` (per-model sidecar allowlist), `nonIndexedFields`, and `cleanupNonIndexedSidecars` options. By default Better Auth account secrets (`password`, `accessToken`, `refreshToken`, `idToken`) are no longer sidecar-indexed: core never queries by them, and each sidecar held extra plaintext copies and cost a transactional write on every token refresh.
 - `lowCardinalityFields` option, defaulting to `{ account: ["providerId"] }`, to tell the planner which fields to avoid as an anchor. Boolean and `null` equalities are always treated as low-cardinality. No storage-format change.
 
 ## [1.1.0] - 2026-09-19

@@ -77,8 +77,67 @@ describe("DynamoDBStore", () => {
     await store.create("user", { id: "u1", email: "a@example.com" });
     const command = doc.send.mock.calls[0]?.[0] as TransactWriteCommand;
     expect(command).toBeInstanceOf(TransactWriteCommand);
-    expect(command.input.TransactItems).toHaveLength(4);
+    // entity + email sidecar + email unique lock; `id` is the entity key and gets no sidecar.
+    expect(command.input.TransactItems).toHaveLength(3);
     expect(command.input.TransactItems).toContainEqual(expect.objectContaining({ Put: expect.objectContaining({ Item: expect.objectContaining({ pk: uniquePk("user", "email") }) }) }));
+  });
+
+  it("never sidecar-indexes id or configured non-indexed fields, and keeps no plaintext value copies", async () => {
+    const doc = client();
+    const store = new DynamoDBStore({ tableName: "auth", client: doc as never, uniqueFields: { account: ["accountId"] }, nonIndexedFields: { account: ["password", "accessToken"] } });
+    await store.create("account", { id: "a1", userId: "u1", providerId: "credential", accountId: "u1", password: "hash", accessToken: "secret" });
+    const items = ((doc.send.mock.calls[0]?.[0] as TransactWriteCommand).input.TransactItems ?? []).map((item) => item.Put?.Item as Record<string, unknown>);
+    const sidecars = items.filter((item) => item.model === "_index_account");
+    expect(sidecars.map((item) => item.indexField).sort()).toEqual(["accountId", "providerId", "userId"]);
+    for (const item of items.filter((row) => row.model !== "account")) {
+      expect(JSON.stringify(item)).not.toMatch(/hash|secret/);
+      expect(item).not.toHaveProperty("indexValue");
+      expect(item.entity).not.toHaveProperty("value");
+    }
+    expect(items.find((item) => item.model === "_unique_account")?.id).toBe("accountId:a1");
+  });
+
+  it("limits sidecars to a configured per-model allowlist", async () => {
+    const doc = client();
+    const store = new DynamoDBStore({ tableName: "auth", client: doc as never, indexedFields: { session: ["token", "userId"] } });
+    await store.create("session", { id: "s1", token: "t1", userId: "u1", ipAddress: "1.2.3.4", userAgent: "x", expiresAt: "2030-01-01T00:00:00.000Z" });
+    const items = ((doc.send.mock.calls[0]?.[0] as TransactWriteCommand).input.TransactItems ?? []).map((item) => item.Put?.Item as Record<string, unknown>);
+    expect(items.filter((item) => item.model === "_index_session").map((item) => item.indexField).sort()).toEqual(["token", "userId"]);
+    await store.create("user", { id: "u1", name: "A" });
+    const userItems = ((doc.send.mock.calls[1]?.[0] as TransactWriteCommand).input.TransactItems ?? []).map((item) => item.Put?.Item as Record<string, unknown>);
+    expect(userItems.filter((item) => item.model === "_index_user").map((item) => item.indexField)).toEqual(["name"]);
+  });
+
+  it("refuses to anchor on non-indexed fields but still uses another indexed anchor", async () => {
+    const owner = { pk: modelPk("session"), sk: entitySk("s1"), id: "s1", token: "t1", userAgent: "x", entity: { id: "s1", token: "t1", userAgent: "x" }, ...rev };
+    const doc = client();
+    doc.send.mockImplementation(async (command) => (command instanceof QueryCommand ? { Items: [{ pk: "x", sk: indexSk("s1"), ownerPk: modelPk("session"), ownerSk: entitySk("s1"), entity: {} }] } : { Item: owner }));
+    const store = new DynamoDBStore({ tableName: "auth", client: doc as never, indexedFields: { session: ["token"] } });
+    await expect(store.findOne("session", [eq("userAgent", "x")])).rejects.toThrow(/Field "userAgent" is not sidecar-indexed/);
+    await expect(store.findMany("session", [{ field: "userAgent", operator: "in", value: ["x"], connector: "AND", mode: "sensitive" }])).rejects.toThrow(UnsupportedQueryError);
+    await expect(store.findOne("session", [eq("userAgent", "x"), eq("token", "t1")])).resolves.toMatchObject({ id: "s1" });
+    const query = doc.send.mock.calls.map((call) => call[0]).find((command) => command instanceof QueryCommand) as QueryCommand;
+    expect(query.input.ExpressionAttributeValues?.[":pk"]).toBe(indexPk("session", "token", "t1"));
+  });
+
+  it("deletes retired sidecars of non-indexed fields on mutation unless cleanup is disabled", async () => {
+    const row = { pk: modelPk("account"), sk: entitySk("a1"), model: "account", id: "a1", userId: "u1", password: "hash", entity: { id: "a1", userId: "u1", password: "hash" }, ...rev };
+    const retiredKeys = [indexPk("account", "id", "a1"), indexPk("account", "password", "hash")];
+    for (const cleanupNonIndexedSidecars of [undefined, false]) {
+      for (const mutate of [(store: DynamoDBStore) => store.update("account", [eq("id", "a1")], { password: "hash2" }), (store: DynamoDBStore) => store.delete("account", [eq("id", "a1")]), (store: DynamoDBStore) => store.incrementOne("account", [eq("id", "a1")], { logins: 1 })]) {
+        const doc = client([row]);
+        const store = new DynamoDBStore({ tableName: "auth", client: doc as never, nonIndexedFields: { account: ["password"] }, ...(cleanupNonIndexedSidecars === undefined ? {} : { cleanupNonIndexedSidecars }) });
+        await mutate(store);
+        const actions = (doc.send.mock.calls[1]?.[0] as TransactWriteCommand).input.TransactItems ?? [];
+        const deleted = actions.flatMap((action) => (action.Delete ? [String(action.Delete.Key?.pk)] : []));
+        const putPks = actions.flatMap((action) => (action.Put ? [String(action.Put.Item?.pk)] : []));
+        expect(putPks).not.toContain(indexPk("account", "password", "hash2"));
+        if (cleanupNonIndexedSidecars === false) expect(deleted.filter((pk) => retiredKeys.includes(pk))).toEqual([]);
+        else expect(deleted).toEqual(expect.arrayContaining(retiredKeys));
+        const retired = actions.find((action) => action.Delete?.Key?.pk === indexPk("account", "password", "hash"));
+        if (retired) expect(retired.Delete?.ConditionExpression).toBe("attribute_not_exists(#pk) OR (#ownerPk = :ownerPk AND #ownerSk = :ownerSk)");
+      }
+    }
   });
 
   it("guards sidecar and unique-lock deletion by the expected owner", async () => {
