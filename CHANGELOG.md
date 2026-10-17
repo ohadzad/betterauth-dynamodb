@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Security
+
+- Transactional writes no longer request `ReturnValuesOnConditionCheckFailure: "ALL_OLD"`. Nothing in the adapter read the returned items, but AWS attached the full stored row (for example an account's password hash or OAuth tokens) to `TransactionCanceledException.CancellationReasons[].Item`, and `DynamoDBConflictError` carried that exception as `cause`, so logging a conflict could leak secrets.
+- `DynamoDBConflictError.cause` is now a redacted `{ name, message, cancellationCodes }` object instead of the raw AWS exception.
+
 ### Changed
 
 - Updated Better Auth development dependencies (`better-auth`, `@better-auth/core`, `@better-auth/oauth-provider`, `@better-auth/test-utils`) to 1.7.10. The peer dependency range is unchanged.
