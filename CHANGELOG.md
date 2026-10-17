@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Changed
+
+- Updated Better Auth development dependencies (`better-auth`, `@better-auth/core`, `@better-auth/oauth-provider`, `@better-auth/test-utils`) to 1.7.10. The peer dependency range is unchanged.
+
+### Tests
+
+- New `test/integration/production-defaults.test.ts` runs real Better Auth HTTP flows against DynamoDB Local with production-shaped options (no `unsafeAllowScan`, a 3-page budget, TTL with `verification.disableCleanup`, and the README's core-only `indexedFields`): email/password sign-up, sign-in, list/revoke sessions, change password, sign-out, password reset with single-use verification tokens, native Google and Apple ID-token sign-in with account linking by verified email across more provider accounts than the page budget can drain, and concurrent duplicate sign-ups.
+
 ### Changed (storage format, backwards compatible)
 
 - `id` no longer gets a scalar sidecar: it is the entity key and the planner always reads it with `GetItem`. Creates write one fewer transactional action.
