@@ -126,6 +126,27 @@ describe("DynamoDBStore", () => {
     await expect(store.findMany("user", [], 10, 0, undefined, ["id", "email"])).resolves.toEqual([{ id: "u1", email: "a@example.com" }]);
   });
 
+  it("queries the accountId sidecar, not the shared providerId sidecar, for Better Auth account lookups", async () => {
+    const owner = { pk: modelPk("account"), sk: entitySk("a1"), id: "a1", providerId: "google", accountId: "g-1", entity: { id: "a1", providerId: "google", accountId: "g-1" }, ...rev };
+    const sidecar = { pk: indexPk("account", "accountId", "g-1"), sk: indexSk("a1"), ownerPk: modelPk("account"), ownerSk: entitySk("a1"), entity: {} };
+    const doc = client();
+    doc.send.mockImplementation(async (command) => (command instanceof QueryCommand ? { Items: [sidecar] } : { Item: owner }));
+    const store = new DynamoDBStore({ tableName: "auth", client: doc as never, lowCardinalityFields: { account: ["providerId"] } });
+    await expect(store.findOne("account", [eq("providerId", "google"), eq("accountId", "g-1")])).resolves.toMatchObject({ id: "a1" });
+    const query = doc.send.mock.calls.map((call) => call[0]).find((command) => command instanceof QueryCommand) as QueryCommand;
+    expect(query.input.ExpressionAttributeValues?.[":pk"]).toBe(indexPk("account", "accountId", "g-1"));
+  });
+
+  it("prefers configured unique fields as the keyed anchor", async () => {
+    const owner = { pk: modelPk("user"), sk: entitySk("u1"), id: "u1", org: "o1", email: "a@example.com", entity: { id: "u1", org: "o1", email: "a@example.com" }, ...rev };
+    const doc = client();
+    doc.send.mockImplementation(async (command) => (command instanceof QueryCommand ? { Items: [{ pk: "x", sk: indexSk("u1"), ownerPk: modelPk("user"), ownerSk: entitySk("u1"), entity: {} }] } : { Item: owner }));
+    const store = new DynamoDBStore({ tableName: "auth", client: doc as never, uniqueFields: { user: ["email"] } });
+    await store.findOne("user", [eq("org", "o1"), eq("email", "a@example.com")]);
+    const query = doc.send.mock.calls.map((call) => call[0]).find((command) => command instanceof QueryCommand) as QueryCommand;
+    expect(query.input.ExpressionAttributeValues?.[":pk"]).toBe(indexPk("user", "email", "a@example.com"));
+  });
+
   it("preserves typed scalar equality in sidecar keys for plugin-like fields", async () => {
     const doc = client();
     const store = new DynamoDBStore({ tableName: "auth", client: doc as never });

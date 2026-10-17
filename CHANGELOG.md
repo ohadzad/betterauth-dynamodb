@@ -4,6 +4,16 @@ All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- The query planner now anchors keyed reads on the most selective scalar equality instead of the first one. Better Auth core looks up OAuth accounts with `providerId` before `accountId`, so every Google/Apple sign-in previously queried the `providerId` sidecar partition, drained every account of that provider, and issued one owner `GetItem` per account (or threw once `maxPages` was reached). Unique fields are preferred, then ordinary fields, then low-cardinality fields.
+
+### Added
+
+- `lowCardinalityFields` option, defaulting to `{ account: ["providerId"] }`, to tell the planner which fields to avoid as an anchor. Boolean and `null` equalities are always treated as low-cardinality. No storage-format change.
+
 ## [1.1.0] - 2026-09-19
 
 ### Added

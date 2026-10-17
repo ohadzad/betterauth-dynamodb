@@ -216,6 +216,15 @@ describe("DynamoDB Local adapter integration", () => {
     await expect(adapter.findOne({ model: "plugin", where: [eq("id", "active")] })).resolves.toMatchObject({ id: "active", ttl: 1, expiresAt: "2030-01-01T00:00:00.000Z" });
   });
 
+  it("resolves OAuth account keys without walking every account of the provider", async () => {
+    const adapter = adapterFor({ client: docClient, pageSize: 1, maxPages: 3 });
+    await create(adapter, "user", { id: "u-oauth", name: "O", email: "oauth@example.com" });
+    for (let index = 0; index < 8; index += 1) await create(adapter, "account", { id: `acc-${index}`, userId: "u-oauth", providerId: "google", accountId: `google-${index}` });
+
+    await expect(adapter.findOne({ model: "account", where: [eq("providerId", "google"), eq("accountId", "google-5")] })).resolves.toMatchObject({ id: "acc-5" });
+    await expect(adapter.findOne({ model: "account", where: [eq("providerId", "apple"), eq("accountId", "google-5")] })).resolves.toBeNull();
+  });
+
   it("uses real DynamoDB Query and Scan pagination with small page sizes", async () => {
     const adapter = adapterFor({ client: docClient, unsafeAllowScan: true, pageSize: 1, maxPages: 30 });
     await create(adapter, "user", { id: "u1", name: "C", org: "o1", email: "c@example.com" });

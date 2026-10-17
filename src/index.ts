@@ -22,7 +22,8 @@ export function dynamoDBAdapter(adapterOptions: BetterAuthDynamoDBOptions) {
     adapter: ({ schema, getModelName, getFieldName }) => {
       const schemaUniqueFields = collectUniqueFields(schema, getModelName, getFieldName);
       const schemaUniqueIndexes = adapterOptions.enforceSchemaUniqueIndexes ? collectSchemaUniqueIndexes(schema, getModelName, getFieldName) : [];
-      const store = new DynamoDBStore({ ...adapterOptions, uniqueFields: mergeUniqueFields(schemaUniqueFields, adapterOptions.uniqueFields), schemaUniqueIndexes });
+      const lowCardinalityFields = mergeUniqueFields(defaultLowCardinalityFields(getModelName, getFieldName), adapterOptions.lowCardinalityFields);
+      const store = new DynamoDBStore({ ...adapterOptions, uniqueFields: mergeUniqueFields(schemaUniqueFields, adapterOptions.uniqueFields), lowCardinalityFields, schemaUniqueIndexes });
       const adapter: any = {
         create: <T extends Record<string, unknown>>(data: { model: string; data: T }) => store.create(data.model, data.data),
         findOne: <T>(data: { model: string; where: any[]; select?: string[]; join?: Record<string, unknown> }) => {
@@ -54,6 +55,11 @@ function mergeUniqueFields(...sources: (Record<string, string[]> | undefined)[])
     for (const [model, fields] of Object.entries(source ?? {})) merged[model] = [...new Set([...(merged[model] ?? []), ...fields])];
   }
   return merged;
+}
+
+/** Better Auth core looks accounts up by providerId + accountId with providerId first; providerId is shared by every account of a provider. */
+function defaultLowCardinalityFields(getModelName: ModelNameResolver, getFieldName: FieldNameResolver): Record<string, string[]> {
+  return { [getModelName("account")]: [getFieldName({ model: "account", field: "providerId" })] };
 }
 
 type AdapterSchema = Record<string, { fields: Record<string, { unique?: boolean | undefined }> }>;

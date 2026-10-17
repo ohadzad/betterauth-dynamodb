@@ -1,22 +1,23 @@
 import { UnsupportedQueryError } from "./errors.js";
-import type { CleanedWhere, QueryPlan } from "./types.js";
+import type { CleanedWhere, PlannerHints, QueryPlan } from "./types.js";
 
 type WhereOperator = CleanedWhere["operator"];
 
-export function planQuery(where: CleanedWhere[] = [], allowScan = false): QueryPlan {
+export function planQuery(where: CleanedWhere[] = [], allowScan = false, hints: PlannerHints = {}): QueryPlan {
   assertSupportedOperators(where);
   const keyedProblem = keyedAccessProblem(where);
   if (keyedProblem) return scanOrThrow(where, allowScan, keyedProblem);
-  const keyed = keyedPlan(where);
+  const keyed = keyedPlan(where, hints);
   if (keyed) return keyed;
   if (allowScan) return { kind: "byModel", where };
   throw new UnsupportedQueryError("Query requires a table scan. Pass unsafeAllowScan to enable bounded scans explicitly.");
 }
 
-function keyedPlan(where: CleanedWhere[]): QueryPlan | undefined {
+function keyedPlan(where: CleanedWhere[], hints: PlannerHints): QueryPlan | undefined {
   if (eqWhere(where, "id")) return { kind: "byId", where };
   if (inWhere(where, "id")) return { kind: "byIdValues", where };
-  if (firstEquality(where)) return { kind: "byFieldValue", where };
+  const clause = mostSelectiveEquality(where, hints);
+  if (clause) return { kind: "byFieldValue", where, clause };
   if (safeInWhere(where)) return { kind: "byFieldValues", where };
   return undefined;
 }
@@ -26,8 +27,24 @@ export function matchesWhere(item: Record<string, unknown>, where: CleanedWhere[
   return where.reduce((acc, clause, index) => combine(acc, evalClause(item, clause), clause.connector, index), true);
 }
 
-export function firstEquality(where: CleanedWhere[] = []): CleanedWhere | undefined {
-  return where.find((w) => isKeyedEquality(w) && isScalar(w.value));
+/**
+ * Picks the equality clause whose sidecar partition is expected to be smallest:
+ * unique fields first, ordinary fields next, and low-cardinality fields (booleans,
+ * nulls, configured fields such as account.providerId) last. Ties keep where order.
+ */
+export function mostSelectiveEquality(where: CleanedWhere[] = [], hints: PlannerHints = {}): CleanedWhere | undefined {
+  const candidates = where.filter((w) => isKeyedEquality(w) && isScalar(w.value));
+  return candidates.reduce<CleanedWhere | undefined>((best, clause) => (best && selectivityRank(best, hints) >= selectivityRank(clause, hints) ? best : clause), undefined);
+}
+
+function selectivityRank(clause: CleanedWhere, hints: PlannerHints): number {
+  if (hints.uniqueFields?.includes(clause.field)) return 3;
+  return isLowCardinality(clause, hints) ? 1 : 2;
+}
+
+function isLowCardinality(clause: CleanedWhere, hints: PlannerHints): boolean {
+  if (clause.value === null || typeof clause.value === "boolean") return true;
+  return hints.lowCardinalityFields?.includes(clause.field) ?? false;
 }
 
 export function inWhere(where: CleanedWhere[], field: string): CleanedWhere | undefined {

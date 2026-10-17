@@ -16,6 +16,12 @@ export interface BetterAuthDynamoDBOptions {
   enforceSchemaUniqueIndexes?: boolean;
   /** Maximum number of independent bulk transactions in flight. */
   maxBulkConcurrency?: number;
+  /**
+   * Fields whose values are shared by many rows (per model). The query planner avoids
+   * anchoring a keyed read on these when a more selective equality is available.
+   * Merged with the built-in default `{ account: ["providerId"] }`.
+   */
+  lowCardinalityFields?: Record<string, string[]>;
 }
 
 /** Store options: public adapter options plus schema metadata resolved and validated by the adapter factory. */
@@ -71,4 +77,11 @@ export interface CleanedWhere {
 export interface QueryPlan {
   kind: "byId" | "byIdValues" | "byFieldValue" | "byFieldValues" | "byModel";
   where: CleanedWhere[];
+  /** The equality clause chosen to anchor a byFieldValue sidecar query. */
+  clause?: CleanedWhere;
+}
+
+export interface PlannerHints {
+  uniqueFields?: readonly string[];
+  lowCardinalityFields?: readonly string[];
 }

@@ -11,8 +11,8 @@ import { createDocumentClient, normalizeOptions } from "./client.js";
 import { DynamoDBAdapterError, DynamoDBConflictError, isConditionalCheckFailed, isConditionalTransactionCanceled, transactionCancellationCodes } from "./errors.js";
 import { entitySk, indexPk, modelPk } from "./keys.js";
 import { REVISION_ATTRIBUTE, fromStoredItem, isLogicallyExpired, revisionOf, stripUndefined, toIndexSidecars, toSchemaUniqueLocks, toStoredItem, toUniqueLocks, ttlAttribute } from "./serialize.js";
-import type { CleanedWhere, DynamoDBStoreOptions, QueryPlan, SidecarItem, StoredItem, TtlOptions } from "./types.js";
-import { eqWhere, firstEquality, inWhere, matchesWhere, planQuery, safeInWhere, scalarValues } from "./where.js";
+import type { CleanedWhere, DynamoDBStoreOptions, PlannerHints, QueryPlan, SidecarItem, StoredItem, TtlOptions } from "./types.js";
+import { eqWhere, inWhere, matchesWhere, mostSelectiveEquality, planQuery, safeInWhere, scalarValues } from "./where.js";
 
 const MAX_TRANSACT_ITEMS = 100;
 const MAX_IN_VALUES = 1000;
@@ -38,13 +38,13 @@ export class DynamoDBStore {
   }
 
   async findMany<T>(model: string, where: CleanedWhere[] = [], limit = 100, offset = 0, sortBy?: { field: string; direction: "asc" | "desc" }, select?: string[]): Promise<T[]> {
-    const plan = planQuery(where, this.options.unsafeAllowScan);
+    const plan = this.plan(model, where);
     const rows = await this.loadRows(model, plan);
     return selectWindow(rows.filter((row) => matchesWhere(row, where)), limit, offset, sortBy, this.options.ttl, select) as T[];
   }
 
   async count(model: string, where: CleanedWhere[] = []): Promise<number> {
-    const plan = planQuery(where, this.options.unsafeAllowScan);
+    const plan = this.plan(model, where);
     const rows = await this.loadRows(model, plan);
     return rows.filter((row) => matchesWhere(row, where)).length;
   }
@@ -112,13 +112,21 @@ export class DynamoDBStore {
     }
   }
 
+  private plan(model: string, where: CleanedWhere[]): QueryPlan {
+    return planQuery(where, this.options.unsafeAllowScan, this.plannerHints(model));
+  }
+
+  private plannerHints(model: string): PlannerHints {
+    return { uniqueFields: this.options.uniqueFields?.[model] ?? [], lowCardinalityFields: this.options.lowCardinalityFields?.[model] ?? [] };
+  }
+
   private async targetByWhere(model: string, where: CleanedWhere[]): Promise<StoredItem | null> {
-    const rows = await this.loadRows(model, planQuery(where, this.options.unsafeAllowScan));
+    const rows = await this.loadRows(model, this.plan(model, where));
     return rows.find((row) => matchesWhere(row, where)) ?? null;
   }
 
   private async matchingTargets(model: string, where: CleanedWhere[]): Promise<StoredItem[]> {
-    const rows = await this.loadRows(model, planQuery(where, this.options.unsafeAllowScan));
+    const rows = await this.loadRows(model, this.plan(model, where));
     return rows.filter((row) => matchesWhere(row, where));
   }
 
@@ -130,7 +138,7 @@ export class DynamoDBStore {
   private async loadRows(model: string, plan: QueryPlan): Promise<StoredItem[]> {
     if (plan.kind === "byId") return this.loadById(model, plan.where);
     if (plan.kind === "byIdValues") return this.loadByIds(model, plan.where);
-    if (plan.kind === "byFieldValue") return this.loadByField(model, plan.where);
+    if (plan.kind === "byFieldValue") return this.loadByField(model, plan);
     if (plan.kind === "byFieldValues") return this.loadByFields(model, plan.where);
     return this.scanModel(model);
   }
@@ -141,8 +149,8 @@ export class DynamoDBStore {
     return visibleRows(result.Item ? [result.Item as StoredItem] : [], this.options.ttl);
   }
 
-  private async loadByField(model: string, where: CleanedWhere[]): Promise<StoredItem[]> {
-    const clause = firstEquality(where);
+  private async loadByField(model: string, plan: QueryPlan): Promise<StoredItem[]> {
+    const clause = plan.clause ?? mostSelectiveEquality(plan.where, this.plannerHints(model));
     if (!clause) return [];
     const sidecars = await this.queryAllSidecars(model, clause);
     return this.loadOwners(sidecars, clause);
